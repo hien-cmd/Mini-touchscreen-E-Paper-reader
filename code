@@ -1,0 +1,516 @@
+
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD_MMC.h>
+#include <GxEPD2_BW.h>
+#include <Fonts/FreeMonoBold12pt7b.h>
+#include "esp_sleep.h"
+#include <driver/gpio.h>
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PINS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+#define EPD_DC      10
+#define EPD_CS      11
+#define EPD_SCK     12
+#define EPD_MOSI    13
+#define EPD_RST     9
+#define EPD_BUSY    8
+#define EPD_PWR     6     // ACTIVE-LOW  (LOW = panel ON, HIGH = panel OFF)
+#define VBAT_PWR    17    // Battery rail enable (HIGH = on)
+#define LED_PIN     3
+
+
+#define I2C_SDA     47
+#define I2C_SCL     48
+
+
+#define TP_RST      7
+#define TP_INT      21
+#define TP_ADDR     0x38
+
+
+#define SD_CLK      39
+#define SD_CMD      41
+#define SD_D0       40
+
+
+#define SPI_CLOCK_HZ  4000000
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SLEEP CONFIG
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+#define SLEEP_TIMEOUT_MS    30000   // Auto-sleep after 30s inactivity
+#define WAKE_INT_PIN        TP_INT  // Wake on touch interrupt
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// E-PAPER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+GxEPD2_BW<GxEPD2_154_D67, GxEPD2_154_D67::HEIGHT> display(
+ GxEPD2_154_D67(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
+);
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FT6336U TOUCH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+class FT6336U {
+ TwoWire *w;
+ uint8_t addr;
+public:
+ FT6336U(TwoWire *wire, uint8_t a) : w(wire), addr(a) {}
+
+
+ void begin(uint8_t rstPin) {
+   pinMode(rstPin, OUTPUT);
+   digitalWrite(rstPin, LOW);  delay(20);
+   digitalWrite(rstPin, HIGH); delay(100);
+ }
+
+
+ bool read(uint16_t &x, uint16_t &y) {
+   w->beginTransmission(addr);
+   w->write(0x02);
+   if (w->endTransmission(false)) return false;
+   w->requestFrom(addr, (uint8_t)5);
+   if (w->available() < 5) return false;
+
+
+   uint8_t td = w->read();
+   uint8_t xh = w->read(), xl = w->read();
+   uint8_t yh = w->read(), yl = w->read();
+   if (td == 0) return false;
+
+
+   x = ((xh & 0x0F) << 8) | xl;
+   y = ((yh & 0x0F) << 8) | yl;
+   x = constrain(map(x, 0, 320, 0, 199), 0, 199);
+   y = constrain(map(y, 0, 320, 0, 199), 0, 199);
+   return true;
+ }
+};
+
+
+FT6336U touch(&Wire, TP_ADDR);
+
+
+volatile bool touchFlag = false;
+void IRAM_ATTR touchISR() { touchFlag = true; }
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// APP STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+enum Screen { SCR_BROWSER, SCR_READER };
+Screen screen = SCR_BROWSER;
+
+
+std::vector<String> files;
+String currentFile = "";
+String fileContent = "";
+std::vector<String> lines;
+int page = 0, totalPages = 1;
+
+
+// Touch gesture
+bool wasTouching = false;
+uint16_t touchStartX, touchStartY;
+uint16_t touchLastX,  touchLastY;
+unsigned long touchStartMs = 0;
+int pendingGesture = 0;   // -1=up/next  +1=down/prev  2=tap
+
+
+// Activity tracker for auto-sleep
+unsigned long lastActivityMs = 0;
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SD CARD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+bool initSD() {
+ SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0);
+ if (!SD_MMC.begin("/sdcard", true)) { Serial.println("[SD] mount fail"); return false; }
+ uint8_t t = SD_MMC.cardType();
+ if (t == CARD_NONE) { Serial.println("[SD] no card"); return false; }
+ Serial.printf("[SD] OK  type=%d  size=%lluMB\n", t, SD_MMC.cardSize()/(1024*1024));
+ return true;
+}
+
+
+void listFiles() {
+ files.clear();
+ File r = SD_MMC.open("/");
+ if (!r || !r.isDirectory()) return;
+ File f;
+ while ((f = r.openNextFile())) {
+   String n = f.name();
+   if (!f.isDirectory() && (n.endsWith(".txt") || n.endsWith(".TXT"))) {
+     files.push_back(n);
+     Serial.printf("  file: %s (%d bytes)\n", n.c_str(), f.size());
+   }
+   f.close();
+ }
+}
+
+
+String readFile(const char *path) {
+ File f = SD_MMC.open(path);
+ if (!f) return "";
+ String s = f.readString();
+ f.close();
+ return s;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEXT PAGINATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+#define MARGIN_X      4
+#define MARGIN_Y      4
+#define LINE_H        10
+#define CHAR_W        6
+#define LINES_PER_PAGE  ((200 - MARGIN_Y*2) / LINE_H)
+#define CHARS_PER_LINE  ((200 - MARGIN_X*2) / CHAR_W)
+
+
+void buildLines(const String &text) {
+ lines.clear();
+ String cur = "";
+ for (int i = 0; i < (int)text.length(); i++) {
+   char c = text[i];
+   if (c == '\r') continue;
+   if (c == '\n') { lines.push_back(cur); cur = ""; continue; }
+   cur += c;
+   if ((int)cur.length() >= CHARS_PER_LINE) {
+     int cut = cur.length() - 1;
+     while (cut > 0 && cur[cut] != ' ') cut--;
+     if (cut > 0) {
+       lines.push_back(cur.substring(0, cut));
+       cur = cur.substring(cut + 1);
+     } else {
+       lines.push_back(cur);
+       cur = "";
+     }
+   }
+ }
+ if (cur.length()) lines.push_back(cur);
+ totalPages = (lines.size() + LINES_PER_PAGE - 1) / LINES_PER_PAGE;
+ if (totalPages < 1) totalPages = 1;
+ page = 0;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DRAWING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+void drawBrowser() {
+ digitalWrite(LED_PIN, HIGH);
+ display.setFullWindow();
+ display.firstPage();
+ do {
+   display.fillScreen(GxEPD_WHITE);
+   display.setTextColor(GxEPD_BLACK);
+   display.setFont(&FreeMonoBold12pt7b);
+   display.setCursor(10, 22);
+   display.print("SD FILES");
+   display.fillRect(10, 26, 180, 2, GxEPD_BLACK);
+
+
+   display.setFont();
+   display.setTextSize(1);
+   if (files.empty()) {
+     display.setCursor(10, 60);
+     display.print("No .txt files");
+   } else {
+     for (int i = 0; i < (int)files.size() && i < 6; i++) {
+       int y = 40 + i * 26;
+       display.drawRect(8, y - 12, 184, 24, GxEPD_BLACK);
+       display.setCursor(14, y);
+       String name = files[i];
+       if (name.length() > 28) name = name.substring(0, 28);
+       display.print(name);
+     }
+   }
+ } while (display.nextPage());
+ digitalWrite(LED_PIN, LOW);
+ Serial.println("[DRAW] Browser");
+}
+
+
+void drawReader() {
+ digitalWrite(LED_PIN, HIGH);
+ display.setFullWindow();
+ display.firstPage();
+ do {
+   display.fillScreen(GxEPD_WHITE);
+
+
+   // Header
+   display.fillRect(0, 0, 200, 18, GxEPD_BLACK);
+   display.setTextColor(GxEPD_WHITE);
+   display.setFont();
+   display.setTextSize(1);
+   display.setCursor(4, 5);
+   String hdr = currentFile.substring(1);
+   if (hdr.length() > 18) hdr = hdr.substring(0, 18);
+   display.print(hdr);
+   display.setCursor(160, 5);
+   display.print(String(page+1) + "/" + String(totalPages));
+
+
+   // Body
+   display.setTextColor(GxEPD_BLACK);
+   int start = page * LINES_PER_PAGE;
+   for (int i = 0; i < LINES_PER_PAGE; i++) {
+     int idx = start + i;
+     if (idx >= (int)lines.size()) break;
+     display.setCursor(MARGIN_X, 22 + i * LINE_H);
+     display.print(lines[idx]);
+   }
+
+
+   display.setCursor(4, 192);
+   display.print("^v=page  tap=back");
+ } while (display.nextPage());
+ digitalWrite(LED_PIN, LOW);
+ Serial.printf("[DRAW] Reader %d/%d\n", page+1, totalPages);
+}
+
+
+void openFile(int idx) {
+ if (idx < 0 || idx >= (int)files.size()) return;
+ currentFile = "/" + files[idx];
+ fileContent = readFile(currentFile.c_str());
+ buildLines(fileContent);
+ screen = SCR_READER;
+ drawReader();
+}
+
+
+void nextPage() { if (page < totalPages - 1) { page++; drawReader(); } }
+void prevPage() { if (page > 0) { page--; drawReader(); } }
+void backBrowser() { screen = SCR_BROWSER; drawBrowser(); }
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TOUCH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+void pollTouch() {
+ // Only read I2C when INT is LOW (or ISR flagged)
+ if (!touchFlag && digitalRead(TP_INT) == HIGH) {
+   if (wasTouching) {
+     wasTouching = false;
+     unsigned long dur = millis() - touchStartMs;
+     int dx = (int)touchLastX - (int)touchStartX;
+     int dy = (int)touchLastY - (int)touchStartY;
+     Serial.printf("[TOUCH] UP  dur=%lu  dx=%d  dy=%d\n", dur, dx, dy);
+     if (dur < 400 && abs(dy) > 30 && abs(dy) > abs(dx)) {
+       pendingGesture = (dy < 0) ? -1 : 1;
+       Serial.println("[GESTURE] Swipe");
+     }
+     else if (dur < 350 && abs(dx) < 15 && abs(dy) < 15) {
+       pendingGesture = 2;
+       Serial.println("[GESTURE] Tap");
+     }
+   }
+   return;
+ }
+
+
+ uint16_t x, y;
+ if (!touch.read(x, y)) { touchFlag = false; return; }
+ touchFlag = false;
+ lastActivityMs = millis();  // reset sleep timer on any touch
+
+
+ if (!wasTouching) {
+   wasTouching = true;
+   touchStartX = x; touchStartY = y;
+   touchLastX  = x; touchLastY  = y;
+   touchStartMs = millis();
+   pendingGesture = 0;
+   Serial.printf("[TOUCH] DOWN (%d,%d)\n", x, y);
+ } else {
+   touchLastX = x; touchLastY = y;
+ }
+}
+
+
+void handleGesture() {
+ if (pendingGesture == 0) return;
+ int g = pendingGesture;
+ pendingGesture = 0;
+ lastActivityMs = millis();  // reset sleep timer on action
+
+
+ if (screen == SCR_BROWSER && g == 2) {
+   int row = (touchStartY - 28) / 26;
+   if (row >= 0 && row < (int)files.size()) {
+     Serial.printf("[ACTION] Open #%d\n", row);
+     openFile(row);
+   }
+ }
+ else if (screen == SCR_READER) {
+   if (g == -1) { Serial.println("[ACTION] Next"); nextPage(); }
+   else if (g == 1) { Serial.println("[ACTION] Prev"); prevPage(); }
+   else if (g == 2) { Serial.println("[ACTION] Back"); backBrowser(); }
+ }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SLEEP / POWER OFF
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+void goToSleep() {
+ Serial.println("\n[SLEEP] Entering deep sleep...");
+
+
+ // 1. Hibernate e-paper (keeps image, stops consuming power)
+ display.hibernate();
+
+
+ // 2. Cut e-paper power (EPD_PWR is ACTIVE-LOW, so HIGH = OFF)
+ digitalWrite(EPD_PWR, HIGH);
+
+
+ // 3. Turn off LED
+ digitalWrite(LED_PIN, LOW);
+
+
+ // 4. Hold GPIO states during deep sleep
+ gpio_hold_en((gpio_num_t)EPD_PWR);
+ gpio_hold_en((gpio_num_t)LED_PIN);
+ gpio_deep_sleep_hold_en();
+
+
+ // 5. Configure wake source for ESP32-S3 using modern GPIO wakeup API
+ esp_sleep_enable_ext0_wakeup((gpio_num_t)WAKE_INT_PIN, 0); // Wake when TP_INT goes LOW
+
+
+ // 6. Enter deep sleep — MCU shuts down, ~10uA current
+ delay(10);
+ esp_deep_sleep_start();
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SETUP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+void setup() {
+ Serial.begin(115200);
+ delay(300);
+
+
+ // Clear any leftover pin holds from previous deep sleep cycle
+ gpio_deep_sleep_hold_dis();
+ gpio_hold_dis((gpio_num_t)VBAT_PWR);
+ gpio_hold_dis((gpio_num_t)EPD_PWR);
+ gpio_hold_dis((gpio_num_t)LED_PIN);
+
+
+ // Check wake cause
+ esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+ if (cause == ESP_SLEEP_WAKEUP_EXT0 || cause == ESP_SLEEP_WAKEUP_GPIO) {
+   Serial.println("\n\n=== WAKE by touch ===");
+ } else {
+   Serial.println("\n\n=== Tiny E-Reader ===");
+ }
+
+
+ // Power rails
+ pinMode(VBAT_PWR, OUTPUT);
+ digitalWrite(VBAT_PWR, HIGH);
+
+
+ pinMode(EPD_PWR, OUTPUT);
+ digitalWrite(EPD_PWR, LOW);   // ACTIVE-LOW: LOW = panel ON
+
+
+ pinMode(LED_PIN, OUTPUT);
+ digitalWrite(LED_PIN, HIGH);  // LED on during boot
+
+
+ delay(50);
+
+
+ // EPD
+ SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
+ display.epd2.selectSPI(SPI, SPISettings(SPI_CLOCK_HZ, MSBFIRST, SPI_MODE0));
+ display.init(115200);
+ display.setRotation(0);
+ Serial.println("[EPD] init OK");
+
+
+ // I2C
+ Wire.begin(I2C_SDA, I2C_SCL);
+ Wire.setClock(100000);
+ Serial.println("[I2C] 100kHz");
+
+
+ // Touch
+ touch.begin(TP_RST);
+ pinMode(TP_INT, INPUT_PULLUP);
+ attachInterrupt(digitalPinToInterrupt(TP_INT), touchISR, FALLING);
+ Serial.println("[Touch] INT on GPIO21");
+
+
+ // SD
+ if (initSD()) listFiles();
+
+
+ // First draw
+ drawBrowser();
+ digitalWrite(LED_PIN, LOW);
+
+
+ lastActivityMs = millis();
+ Serial.println("[APP] Ready. Auto-sleep in 30s. Touch to wake.");
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+void loop() {
+ pollTouch();
+ handleGesture();
+
+
+ // Auto-sleep after inactivity
+ if (millis() - lastActivityMs > SLEEP_TIMEOUT_MS) {
+   goToSleep();
+ }
+
+
+ delay(10);
+}
+
