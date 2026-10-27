@@ -1,5 +1,5 @@
 # Mini Touchscreen E-paper reader
-## A mini reader built for the Waveshare ESP32-S3 1.54" E-ink touchscreen board.
+A mini reader built for the Waveshare ESP32-S3 1.54" E-ink touchscreen board.
 
 ##Hardware requirements
 -ESP32-S3 1.54inch e-Paper AIoT Development Board
